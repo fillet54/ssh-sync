@@ -19,7 +19,6 @@ PASSWORD = "IL0ve2Program!2"
 # changed/missing files, accept file transfers, optionally remove extraneous
 # files, and report completion.
 REMOTE_CODE = r"""
-import base64
 import hashlib
 import json
 import os
@@ -48,26 +47,47 @@ def build_manifest(root: Path):
     return entries
 
 
-def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+def send_packet(name: str, payload: bytes):
+    sha_hex = hashlib.sha1(payload).hexdigest()
+    header = f"{sha_hex} {len(payload)} {name}\n".encode("utf-8")
+    sys.stdout.buffer.write(header)
+    if payload:
+        sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
 
 
-def recv():
-    line = sys.stdin.readline()
-    if not line:
+def _read_exact(fin, length: int) -> bytes:
+    data = b""
+    while len(data) < length:
+        chunk = fin.read(length - len(data))
+        if not chunk:
+            raise EOFError("unexpected EOF while reading payload")
+        data += chunk
+    return data
+
+
+def recv_packet():
+    header = sys.stdin.buffer.readline()
+    if not header:
         return None
-    return json.loads(line)
+    try:
+        sha_hex, length_str, name = header.decode("utf-8").rstrip("\n").split(" ", 2)
+        length = int(length_str)
+    except ValueError:
+        raise RuntimeError(f"invalid header line: {header!r}")
+    payload = _read_exact(sys.stdin.buffer, length) if length else b""
+    if hashlib.sha1(payload).hexdigest() != sha_hex:
+        raise RuntimeError(f"sha mismatch for packet {name}")
+    return name, payload
 
 
 def ensure_parent(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def write_file(root: Path, rel_path: str, payload: str, mode: Optional[int]):
+def write_file(root: Path, rel_path: str, data: bytes, mode: Optional[int]):
     dest = root / rel_path
     ensure_parent(dest)
-    data = base64.b64decode(payload)
     with dest.open("wb") as fh:
         fh.write(data)
     if mode is not None:
@@ -95,12 +115,13 @@ def main(remote_root: str):
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
 
-    send({"event": "ready", "root": root.as_posix()})
+    send_packet("ready", json.dumps({"event": "ready", "root": root.as_posix()}).encode("utf-8"))
 
-    manifest_msg = recv()
-    if manifest_msg is None or manifest_msg.get("type") != "manifest":
-        send({"event": "error", "message": "expected manifest"})
+    manifest_packet = recv_packet()
+    if manifest_packet is None or manifest_packet[0] != "manifest":
+        send_packet("error", json.dumps({"event": "error", "message": "expected manifest"}).encode("utf-8"))
         return
+    manifest_msg = json.loads(manifest_packet[1].decode("utf-8"))
 
     host_files = manifest_msg["files"]
     host_map = {item["path"]: item for item in host_files}
@@ -116,24 +137,29 @@ def main(remote_root: str):
 
     extras = [path for path in remote_map.keys() if path not in host_map]
 
-    send({"event": "need_files", "paths": needed, "extras": extras})
+    send_packet(
+        "need_files",
+        json.dumps({"event": "need_files", "paths": needed, "extras": extras}).encode("utf-8"),
+    )
 
     received = set()
     while True:
-        msg = recv()
+        msg = recv_packet()
         if msg is None:
             break
-        if msg.get("type") == "file":
-            rel = msg["path"]
-            write_file(root, rel, msg["data"], msg.get("mode"))
-            received.add(rel)
-            send({"event": "file_written", "path": rel})
-        elif msg.get("type") == "sync_done":
+        name, payload = msg
+        if name == "sync_done":
             break
+
+        rel = name
+        mode = host_map.get(rel, {}).get("mode")
+        write_file(root, rel, payload, mode)
+        received.add(rel)
+        send_packet("file_written", json.dumps({"event": "file_written", "path": rel}).encode("utf-8"))
 
     # Clean up files that do not exist on the host so the directory mirrors.
     remove_extras(root, set(host_map.keys()))
-    send({"event": "complete", "updated": sorted(received)})
+    send_packet("complete", json.dumps({"event": "complete", "updated": sorted(received)}).encode("utf-8"))
 
 
 if __name__ == "__main__":
@@ -172,11 +198,6 @@ def build_manifest(root: Path):
     return entries
 
 
-def encode_file(path: Path) -> str:
-    data = path.read_bytes()
-    return base64.b64encode(data).decode("ascii")
-
-
 def connect(host: str, user: str, password: Optional[str], key_path: Optional[str]) -> paramiko.SSHClient:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -203,52 +224,79 @@ def run_remote_session(ssh: paramiko.SSHClient, remote_dir: str):
     return chan, stdin, stdout, stderr
 
 
-def send_json(fh, obj):
-    fh.write((json.dumps(obj) + "\n").encode("utf-8"))
+def send_packet(fh, name: str, payload: bytes):
+    sha_hex = hashlib.sha1(payload).hexdigest()
+    header = f"{sha_hex} {len(payload)} {name}\n".encode("utf-8")
+    fh.write(header)
+    if payload:
+        fh.write(payload)
     fh.flush()
 
 
-def recv_json(fh):
-    line = fh.readline()
-    if not line:
+def _read_exact(fh, length: int) -> bytes:
+    data = b""
+    while len(data) < length:
+        chunk = fh.read(length - len(data))
+        if not chunk:
+            raise EOFError("unexpected EOF while reading payload")
+        data += chunk
+    return data
+
+
+def recv_packet(fh):
+    header = fh.readline()
+    if not header:
         return None
-    return json.loads(line.decode("utf-8"))
+    try:
+        sha_hex, length_str, name = header.decode("utf-8").rstrip("\n").split(" ", 2)
+        length = int(length_str)
+    except ValueError:
+        raise RuntimeError(f"invalid header line: {header!r}")
+    payload = _read_exact(fh, length) if length else b""
+    if hashlib.sha1(payload).hexdigest() != sha_hex:
+        raise RuntimeError(f"sha mismatch for packet {name}")
+    return name, payload
 
 
 def sync_directory(local_dir: Path, remote_dir: str, ssh: paramiko.SSHClient):
     manifest = build_manifest(local_dir)
     chan, stdin, stdout, stderr = run_remote_session(ssh, remote_dir)
 
-    ready = recv_json(stdout)
-    if ready is None or ready.get("event") != "ready":
+    ready = recv_packet(stdout)
+    if ready is None or ready[0] != "ready":
         raise RuntimeError("remote did not signal readiness")
+    ready_body = json.loads(ready[1].decode("utf-8"))
 
-    send_json(stdin, {"type": "manifest", "files": manifest})
-    response = recv_json(stdout)
-    if response is None or response.get("event") != "need_files":
+    send_packet(stdin, "manifest", json.dumps({"files": manifest}).encode("utf-8"))
+    response = recv_packet(stdout)
+    if response is None or response[0] != "need_files":
         raise RuntimeError("remote did not request files")
+    response_body = json.loads(response[1].decode("utf-8"))
 
-    needed = response.get("paths", [])
-    extras = response.get("extras", [])
+    needed = response_body.get("paths", [])
+    extras = response_body.get("extras", [])
 
-    print(f"Remote root: {ready.get('root')}")
+    print(f"Remote root: {ready_body.get('root')}")
     if extras:
         print(f"Remote will remove {len(extras)} extra file(s): {extras}")
 
     for rel_path in needed:
         path = local_dir / rel_path
-        payload = encode_file(path)
-        mode = int(path.stat().st_mode & 0o777)
-        send_json(stdin, {"type": "file", "path": rel_path, "data": payload, "mode": mode})
-        ack = recv_json(stdout)
-        if ack is None or ack.get("event") != "file_written":
+        payload = path.read_bytes()
+        send_packet(stdin, rel_path, payload)
+        ack = recv_packet(stdout)
+        if ack is None or ack[0] != "file_written":
             raise RuntimeError(f"failed to write {rel_path}")
+        ack_body = json.loads(ack[1].decode("utf-8"))
+        if ack_body.get("path") != rel_path:
+            raise RuntimeError(f"unexpected ack for {ack_body.get('path')}")
 
-    send_json(stdin, {"type": "sync_done"})
-    complete = recv_json(stdout)
-    if complete is None or complete.get("event") != "complete":
+    send_packet(stdin, "sync_done", b"")
+    complete = recv_packet(stdout)
+    if complete is None or complete[0] != "complete":
         raise RuntimeError("sync did not complete")
-    updated = complete.get("updated", [])
+    complete_body = json.loads(complete[1].decode("utf-8"))
+    updated = complete_body.get("updated", [])
     print(f"Updated {len(updated)} file(s): {updated}")
 
     stdin.close()
