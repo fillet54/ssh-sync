@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import json
 import os
 import shlex
 from pathlib import Path
@@ -20,7 +19,6 @@ PASSWORD = "IL0ve2Program!2"
 # files, and report completion.
 REMOTE_CODE = r"""
 import hashlib
-import json
 import os
 import sys
 from pathlib import Path
@@ -81,6 +79,27 @@ def recv_packet():
     return name, payload
 
 
+def parse_manifest_payload(payload: bytes):
+    lines = payload.decode("utf-8").splitlines()
+    if not lines:
+        raise RuntimeError("empty manifest payload")
+    count = int(lines[0])
+    entries = []
+    for line in lines[1:1 + count]:
+        sha, mode_str, path = line.split(" ", 2)
+        entries.append({"path": path, "sha1": sha, "mode": int(mode_str, 8)})
+    if len(entries) != count:
+        raise RuntimeError("manifest count mismatch")
+    return entries
+
+
+def encode_need_files(paths, extras):
+    lines = [f"{len(paths)} {len(extras)}"]
+    lines.extend(paths)
+    lines.extend(extras)
+    return "\n".join(lines).encode("utf-8")
+
+
 def ensure_parent(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -115,15 +134,14 @@ def main(remote_root: str):
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
 
-    send_packet("ready", json.dumps({"event": "ready", "root": root.as_posix()}).encode("utf-8"))
+    send_packet("ready", root.as_posix().encode("utf-8"))
 
     manifest_packet = recv_packet()
     if manifest_packet is None or manifest_packet[0] != "manifest":
-        send_packet("error", json.dumps({"event": "error", "message": "expected manifest"}).encode("utf-8"))
+        send_packet("error", b"expected manifest")
         return
-    manifest_msg = json.loads(manifest_packet[1].decode("utf-8"))
+    host_files = parse_manifest_payload(manifest_packet[1])
 
-    host_files = manifest_msg["files"]
     host_map = {item["path"]: item for item in host_files}
 
     remote_manifest = build_manifest(root)
@@ -137,10 +155,7 @@ def main(remote_root: str):
 
     extras = [path for path in remote_map.keys() if path not in host_map]
 
-    send_packet(
-        "need_files",
-        json.dumps({"event": "need_files", "paths": needed, "extras": extras}).encode("utf-8"),
-    )
+    send_packet("need_files", encode_need_files(needed, extras))
 
     received = set()
     while True:
@@ -155,11 +170,13 @@ def main(remote_root: str):
         mode = host_map.get(rel, {}).get("mode")
         write_file(root, rel, payload, mode)
         received.add(rel)
-        send_packet("file_written", json.dumps({"event": "file_written", "path": rel}).encode("utf-8"))
+        send_packet("file_written", rel.encode("utf-8"))
 
     # Clean up files that do not exist on the host so the directory mirrors.
     remove_extras(root, set(host_map.keys()))
-    send_packet("complete", json.dumps({"event": "complete", "updated": sorted(received)}).encode("utf-8"))
+    complete_paths = sorted(received)
+    lines = [str(len(complete_paths)), *complete_paths]
+    send_packet("complete", "\n".join(lines).encode("utf-8"))
 
 
 if __name__ == "__main__":
@@ -258,6 +275,37 @@ def recv_packet(fh):
     return name, payload
 
 
+def encode_manifest(files):
+    lines = [str(len(files))]
+    for item in files:
+        mode_str = format(item["mode"], "o")
+        lines.append(f"{item['sha1']} {mode_str} {item['path']}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def parse_need_files(payload: bytes):
+    lines = payload.decode("utf-8").splitlines()
+    if not lines:
+        return [], []
+    first = lines[0].split()
+    if len(first) != 2:
+        raise RuntimeError("invalid need_files header")
+    path_count, extra_count = map(int, first)
+    paths = lines[1:1 + path_count]
+    extras_start = 1 + path_count
+    extras = lines[extras_start:extras_start + extra_count]
+    return paths, extras
+
+
+def parse_complete(payload: bytes):
+    lines = payload.decode("utf-8").splitlines()
+    if not lines:
+        return []
+    count = int(lines[0])
+    updated = lines[1:1 + count]
+    return updated
+
+
 def sync_directory(local_dir: Path, remote_dir: str, ssh: paramiko.SSHClient):
     manifest = build_manifest(local_dir)
     chan, stdin, stdout, stderr = run_remote_session(ssh, remote_dir)
@@ -265,18 +313,15 @@ def sync_directory(local_dir: Path, remote_dir: str, ssh: paramiko.SSHClient):
     ready = recv_packet(stdout)
     if ready is None or ready[0] != "ready":
         raise RuntimeError("remote did not signal readiness")
-    ready_body = json.loads(ready[1].decode("utf-8"))
+    ready_root = ready[1].decode("utf-8")
 
-    send_packet(stdin, "manifest", json.dumps({"files": manifest}).encode("utf-8"))
+    send_packet(stdin, "manifest", encode_manifest(manifest))
     response = recv_packet(stdout)
     if response is None or response[0] != "need_files":
         raise RuntimeError("remote did not request files")
-    response_body = json.loads(response[1].decode("utf-8"))
+    needed, extras = parse_need_files(response[1])
 
-    needed = response_body.get("paths", [])
-    extras = response_body.get("extras", [])
-
-    print(f"Remote root: {ready_body.get('root')}")
+    print(f"Remote root: {ready_root}")
     if extras:
         print(f"Remote will remove {len(extras)} extra file(s): {extras}")
 
@@ -287,16 +332,15 @@ def sync_directory(local_dir: Path, remote_dir: str, ssh: paramiko.SSHClient):
         ack = recv_packet(stdout)
         if ack is None or ack[0] != "file_written":
             raise RuntimeError(f"failed to write {rel_path}")
-        ack_body = json.loads(ack[1].decode("utf-8"))
-        if ack_body.get("path") != rel_path:
-            raise RuntimeError(f"unexpected ack for {ack_body.get('path')}")
+        ack_path = ack[1].decode("utf-8")
+        if ack_path != rel_path:
+            raise RuntimeError(f"unexpected ack for {ack_path}")
 
     send_packet(stdin, "sync_done", b"")
     complete = recv_packet(stdout)
     if complete is None or complete[0] != "complete":
         raise RuntimeError("sync did not complete")
-    complete_body = json.loads(complete[1].decode("utf-8"))
-    updated = complete_body.get("updated", [])
+    updated = parse_complete(complete[1])
     print(f"Updated {len(updated)} file(s): {updated}")
 
     stdin.close()
